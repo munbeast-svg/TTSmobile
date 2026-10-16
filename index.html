@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>한→영 음성 통역기 (모바일 대응)</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    background: #0f172a; color: #e2e8f0;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom);
+  }
+  header { padding: 14px 4px 8px; flex: 0 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 3px; }
+  .sub { font-size: 12px; color: #94a3b8; }
+
+  #engine {
+    font-size: 11px; padding: 7px 10px; border-radius: 7px;
+    background: #1e293b; border: 1px solid #334155; margin: 8px 0; line-height: 1.5;
+  }
+  #engine b { color: #e2e8f0; }
+
+  #prog { height: 5px; border-radius: 3px; background: #1e293b; overflow: hidden; margin-bottom: 8px; display: none; }
+  #progFill { height: 100%; width: 0%; background: #3b82f6; transition: width .25s; }
+
+  .bar { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+  button {
+    border: 0; border-radius: 9px; padding: 11px 16px;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+    background: #334155; color: #e2e8f0; touch-action: manipulation;
+  }
+  button:active:not(:disabled) { opacity: .7; }
+  button:disabled { opacity: .35; }
+  #mic { flex: 1 1 150px; background: #2563eb; color: #fff; font-size: 15px; padding: 14px; }
+  #mic.rec { background: #dc2626; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .6; } }
+
+  select { padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 13px; flex: 1 1 140px; max-width: 100%; }
+  label { font-size: 12px; color: #cbd5e1; display: flex; align-items: center; gap: 5px; }
+  .slider { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #94a3b8; }
+  input[type=range] { width: 80px; }
+
+  #meter { height: 5px; border-radius: 3px; background: #1e293b; overflow: hidden; margin-bottom: 8px; }
+  #meterFill { height: 100%; width: 0%; background: #22c55e; transition: width .08s; }
+  #status { font-size: 12px; color: #94a3b8; min-height: 17px; margin-bottom: 8px; }
+  .err { color: #f87171; } .ok { color: #4ade80; } .warn { color: #fbbf24; }
+
+  #log { flex: 1 1 auto; overflow-y: auto; display: flex; flex-direction: column; gap: 9px; padding-bottom: 14px; -webkit-overflow-scrolling: touch; }
+  .card { border: 1px solid #334155; border-radius: 10px; background: #1e293b; padding: 12px 14px; }
+  .card.speaking { border-color: #22c55e; }
+  .card .meta { font-size: 10px; color: #64748b; margin-bottom: 5px; }
+  .card .src { font-size: 13px; color: #94a3b8; margin-bottom: 7px; }
+  .card .dst { font-size: 18px; font-weight: 600; line-height: 1.45; margin-bottom: 8px; word-break: break-word; }
+  .card.pending .dst { color: #64748b; font-weight: 400; font-style: italic; }
+  .card .replay { padding: 6px 13px; font-size: 12px; background: #0f172a; border: 1px solid #475569; border-radius: 7px; }
+  .interim { opacity: .5; border-style: dashed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>한국어 → 영어 음성 통역기</h1>
+  <div class="sub">한국어로 말하면 영어로 번역해 미국 발음으로 읽어줍니다.</div>
+</header>
+
+<div id="engine">엔진 확인 중...</div>
+<div id="prog"><div id="progFill"></div></div>
+
+<div class="bar">
+  <button id="mic">🎤 말하기</button>
+  <button id="clear">지우기</button>
+  <button id="test">발음 테스트</button>
+</div>
+<div class="bar">
+  <select id="voice"><option>보이스 로드 중...</option></select>
+  <label><input type="checkbox" id="autoSpeak" checked> 자동 읽기</label>
+  <div class="slider">속도 <input type="range" id="rate" min="0.6" max="1.4" step="0.05" value="1"></div>
+</div>
+
+<div id="meter"><div id="meterFill"></div></div>
+<div id="status">대기 중</div>
+<div id="log"></div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const micBtn = $('mic'), status = $('status'), log = $('log'), engineBox = $('engine');
+
+/* ============ 0. 환경 판별 ============ */
+const UA = navigator.userAgent;
+const isIOS = /iPad|iPhone|iPod/.test(UA) || (UA.includes('Mac') && 'ontouchend' in document);
+const isMobile = isIOS || /Android/i.test(UA);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let engine = null;          // 'native' | 'wasm' | null
+let translateFn = null;     // async (koText) => enText
+let loading = false;
+
+/* ============ 1. 번역 엔진: 내장 우선, 없으면 WASM ============ */
+async function initEngine() {
+  // (1) 브라우저 내장 Translator (데스크톱 Chrome 138+)
+  if ('Translator' in self) {
+    try {
+      const avail = await Translator.availability({ sourceLanguage: 'ko', targetLanguage: 'en' });
+      if (avail !== 'unavailable') {
+        setEngineBox('내장 Translator API', '브라우저 온디바이스 번역 · 네트워크 요청 없음');
+        showProg(avail !== 'available');
+        const t = await Translator.create({
+          sourceLanguage: 'ko', targetLanguage: 'en',
+          monitor(m) {
+            m.addEventListener('downloadprogress', e => setProg(e.loaded * 100, '모델 다운로드'));
+          }
+        });
+        hideProg();
+        engine = 'native';
+        translateFn = txt => t.translate(txt);
+        status.innerHTML = '<span class="ok">번역 엔진 준비 완료 (내장)</span>';
+        return;
+      }
+    } catch (_) { /* WASM으로 폴백 */ }
+  }
+
+  // (2) Transformers.js — 모바일 포함 전 브라우저 동작
+  setEngineBox('Transformers.js (WASM)',
+    isMobile ? '모바일용 온디바이스 모델 · 최초 1회 약 60MB 다운로드' : '온디바이스 모델 · 최초 1회 약 60MB 다운로드');
+  try {
+    loading = true;
+    micBtn.disabled = true;
+    showProg(true);
+    status.textContent = '번역 모델을 불러오는 중입니다...';
+
+    const { pipeline, env } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1');
+
+    // ▼ 모델을 직접 저장소에 호스팅하려면 아래 두 줄의 주석을 해제하세요 (외부 요청 0건)
+    // env.allowRemoteModels = false;
+    // env.localModelPath = './models/';
+
+    env.backends.onnx.wasm.numThreads = 1;   // 모바일 안정성 우선
+
+    const seen = {};
+    const translator = await pipeline('translation', 'Xenova/opus-mt-ko-en', {
+      dtype: 'q8',                            // 양자화로 용량·메모리 절감 (모바일 필수)
+      progress_callback: p => {
+        if (p.status === 'progress' && p.file) {
+          seen[p.file] = p.progress || 0;
+          const vals = Object.values(seen);
+          setProg(vals.reduce((a, b) => a + b, 0) / vals.length, '모델 다운로드');
+        }
+      }
+    });
+
+    hideProg();
+    engine = 'wasm';
+    translateFn = async txt => {
+      const out = await translator(txt, { src_lang: 'kor', tgt_lang: 'eng', max_new_tokens: 200 });
+      return (out[0].translation_text || '').trim();
+    };
+    status.innerHTML = '<span class="ok">번역 엔진 준비 완료 — 말하기를 누르세요</span>';
+  } catch (e) {
+    hideProg();
+    engine = null;
+    status.innerHTML = '<span class="err">번역 모델 로드 실패: ' + e.message + '</span>';
+    engineBox.innerHTML = '<b class="err">번역 엔진 없음</b><br>네트워크를 확인하고 새로고침해 주세요. 음성 인식과 발음 기능은 계속 사용할 수 있습니다.';
+  } finally {
+    loading = false;
+    micBtn.disabled = false;
+  }
+}
+
+function setEngineBox(name, desc) { engineBox.innerHTML = '엔진: <b>' + name + '</b><br>' + desc; }
+function showProg(show) { $('prog').style.display = show ? 'block' : 'none'; }
+function hideProg() { $('prog').style.display = 'none'; }
+function setProg(pct, label) {
+  showProg(true);
+  $('progFill').style.width = Math.min(100, pct) + '%';
+  status.textContent = label + ' ' + Math.round(pct) + '%';
+}
+
+/* ============ 2. 미국 영어 TTS ============ */
+const PREFERRED = ['Google US English', 'Samantha', 'Microsoft Aria', 'Microsoft Jenny',
+                   'Microsoft Guy', 'Microsoft Zira', 'Alex', 'Nicky', 'Aaron'];
+let usVoices = [], ttsPrimed = false;
+
+function loadVoices() {
+  const all = speechSynthesis.getVoices();
+  if (!all.length) return;
+  usVoices = all.filter(v => /en[-_]US/i.test(v.lang))
+    .sort((a, b) => {
+      const s = v => { const i = PREFERRED.findIndex(p => v.name.includes(p)); return i === -1 ? 99 : i; };
+      return s(a) - s(b);
+    });
+  if (!usVoices.length) usVoices = all.filter(v => /^en/i.test(v.lang));
+
+  const sel = $('voice');
+  sel.innerHTML = '';
+  if (!usVoices.length) { sel.innerHTML = '<option>미국 보이스 없음 (기본 영어로 재생)</option>'; return; }
+  usVoices.forEach((v, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = v.name.replace(/^Microsoft /, '') + ' · ' + v.lang;
+    sel.appendChild(o);
+  });
+}
+loadVoices();
+speechSynthesis.onvoiceschanged = loadVoices;
+
+// iOS는 사용자 제스처 안에서 한 번 speak() 해야 이후 자동 재생이 허용됨
+function primeTTS() {
+  if (ttsPrimed) return;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0; u.lang = 'en-US';
+  speechSynthesis.speak(u);
+  ttsPrimed = true;
+}
+
+function speakEN(text, card) {
+  if (!text) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  const v = usVoices[$('voice').value | 0];
+  if (v) u.voice = v;
+  u.lang = 'en-US';                       // 보이스가 없어도 미국 발음 강제
+  u.rate = parseFloat($('rate').value);
+  if (card) {
+    u.onstart = () => card.classList.add('speaking');
+    u.onend = u.onerror = () => card.classList.remove('speaking');
+  }
+  // iOS는 cancel 직후 speak가 씹히는 버그가 있어 약간 지연
+  setTimeout(() => speechSynthesis.speak(u), isIOS ? 120 : 0);
+}
+
+/* ============ 3. 카드 ============ */
+let interimCard = null;
+
+function makeCard(src, interim) {
+  const d = document.createElement('div');
+  d.className = 'card pending' + (interim ? ' interim' : '');
+  d.innerHTML = '<div class="meta">' + new Date().toLocaleTimeString('ko-KR') + '</div>' +
+                '<div class="src"></div><div class="dst">번역 중...</div>';
+  d.querySelector('.src').textContent = src;
+  log.prepend(d);
+  return d;
+}
+
+async function handleFinal(text) {
+  text = text.trim();
+  if (!text) return;
+  const card = makeCard(text, false);
+  const dst = card.querySelector('.dst');
+
+  if (!translateFn) {
+    card.classList.remove('pending');
+    dst.innerHTML = '<span class="warn">번역 엔진 미준비 — 인식 결과만 표시합니다</span>';
+    return;
+  }
+  try {
+    const en = await translateFn(text);
+    card.classList.remove('pending');
+    dst.textContent = en;
+    const btn = document.createElement('button');
+    btn.className = 'replay';
+    btn.textContent = '🔊 다시 듣기';
+    btn.onclick = () => speakEN(en, card);
+    card.appendChild(btn);
+    if ($('autoSpeak').checked) speakEN(en, card);
+  } catch (e) {
+    card.classList.remove('pending');
+    dst.innerHTML = '<span class="err">번역 실패: ' + e.message + '</span>';
+  }
+}
+
+/* ============ 4. 음성 인식 (모바일 대응) ============ */
+let recognition = null, listening = false, manualStop = false;
+
+function createRecognition() {
+  const r = new SR();
+  r.lang = 'ko-KR';
+  // 모바일은 continuous가 불안정하거나 미지원 → 단발 인식 후 재시작 방식
+  r.continuous = !isMobile;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+
+  r.onstart = () => {
+    listening = true;
+    micBtn.classList.add('rec');
+    micBtn.textContent = '⏹ 중지';
+    status.textContent = '듣는 중 — 한국어로 말씀하세요';
+  };
+
+  r.onresult = e => {
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const t = e.results[i][0].transcript;
+      if (e.results[i].isFinal) {
+        if (interimCard) { interimCard.remove(); interimCard = null; }
+        handleFinal(t);
+      } else interim += t;
+    }
+    if (interim) {
+      if (interimCard) interimCard.querySelector('.src').textContent = interim;
+      else interimCard = makeCard(interim, true);
+    }
+  };
+
+  r.onerror = e => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    const msg = {
+      'audio-capture': '마이크를 찾을 수 없습니다.',
+      'not-allowed': '마이크 권한이 거부되었습니다. 브라우저 설정에서 허용해 주세요.',
+      'service-not-allowed': '이 브라우저에서 음성 인식이 차단되었습니다.',
+      'network': '네트워크 오류 — 음성 인식은 인터넷 연결이 필요합니다.'
+    }[e.error] || ('오류: ' + e.error);
+    status.innerHTML = '<span class="err">' + msg + '</span>';
+    manualStop = true;
+  };
+
+  r.onend = () => {
+    listening = false;
+    if (!manualStop) {
+      // 모바일 단발 인식 → 자동 재시작으로 연속처럼 동작
+      try { recognition = createRecognition(); recognition.start(); return; } catch (_) {}
+    }
+    micBtn.classList.remove('rec');
+    micBtn.textContent = '🎤 말하기';
+    stopMeter();
+    if (!status.querySelector('.err')) status.textContent = '중지됨';
+  };
+  return r;
+}
+
+/* ============ 5. 레벨 미터 ============ */
+let stream = null, audioCtx = null, rafId = null;
+
+async function startMeter() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();   // iOS
+    const an = audioCtx.createAnalyser(); an.fftSize = 512;
+    audioCtx.createMediaStreamSource(stream).connect(an);
+    const data = new Uint8Array(an.frequencyBinCount), fill = $('meterFill');
+    (function loop() {
+      an.getByteTimeDomainData(data);
+      let s = 0;
+      for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; s += v * v; }
+      fill.style.width = Math.min(100, Math.sqrt(s / data.length) * 300) + '%';
+      rafId = requestAnimationFrame(loop);
+    })();
+  } catch (_) {}
+}
+function stopMeter() {
+  if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (audioCtx) { audioCtx.close(); audioCtx = null; }
+  $('meterFill').style.width = '0%';
+}
+
+/* ============ 6. 컨트롤 ============ */
+micBtn.onclick = async () => {
+  primeTTS();                               // iOS 제스처 안에서 TTS 잠금 해제
+  if (listening) { manualStop = true; speechSynthesis.cancel(); recognition && recognition.stop(); return; }
+  if (!SR) { status.innerHTML = '<span class="err">이 브라우저는 음성 인식을 지원하지 않습니다.</span>'; return; }
+  manualStop = false;
+  await startMeter();
+  recognition = createRecognition();
+  try { recognition.start(); }
+  catch (e) { status.innerHTML = '<span class="err">시작 실패: ' + e.message + '</span>'; }
+};
+
+$('clear').onclick = () => { log.innerHTML = ''; interimCard = null; };
+$('test').onclick = () => { primeTTS(); speakEN('Hello, this is a United States English voice test.', null); };
+
+/* ============ 7. 시작 ============ */
+if (!SR) {
+  status.innerHTML = '<span class="err">음성 인식 미지원 브라우저입니다. Android는 Chrome, iPhone은 Safari를 사용하세요.</span>';
+  micBtn.disabled = true;
+} else if (isIOS) {
+  status.innerHTML = '<span class="warn">iOS에서는 말하기 버튼을 누를 때마다 인식됩니다.</span>';
+}
+initEngine();
+</script>
+</body>
+</html>
